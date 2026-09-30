@@ -4,7 +4,13 @@
 禁止绕过预算入口直接读取原始数据。
 """
 
-from .errors import BudgetExhausted, DuplicateRequest, PrivacySystemError, UnknownVersion
+from .errors import (
+    BudgetExhausted,
+    DuplicateRequest,
+    PrivacySystemError,
+    ReleaseInterrupted,
+    UnknownVersion,
+)
 from .gateway import PrivacyGateway, ReleaseResult
 from .mechanism import laplace_noise
 
@@ -13,6 +19,7 @@ __all__ = [
     "ReleaseResult",
     "laplace_noise",
     "PrivacySystemError",
+    "ReleaseInterrupted",
     "BudgetExhausted",
     "DuplicateRequest",
     "UnknownVersion",

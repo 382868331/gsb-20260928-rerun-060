@@ -19,3 +19,11 @@ class UnknownVersion(PrivacySystemError):
 
 class UnknownOperation(PrivacySystemError):
     """操作未在隐私网关注册。"""
+
+
+class ReleaseInterrupted(PrivacySystemError):
+    """发布已原子提交落盘，但结果在返回调用者之前连接中断。
+
+    预算已扣除、发布事实已持久化；调用者应通过查询/重放取回同一份结果，
+    而不是当作“尚未发布”重新提交。
+    """
