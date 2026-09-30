@@ -11,7 +11,7 @@ from .gateway import PrivacyGateway
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="隐私统计发布系统演示")
-    parser.add_argument("--db", default="privacy_ledger.sqlite3", help="账本数据库路径")
+    parser.add_argument("--db", default="privacy_ledger.json", help="账本文件路径")
     parser.add_argument("--total-epsilon", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=20260929, help="加噪随机源种子")
     args = parser.parse_args()

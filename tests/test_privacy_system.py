@@ -12,7 +12,16 @@ import tempfile
 import threading
 import unittest
 
-from privacy_system import PrivacyGateway, BudgetExhausted, DuplicateRequest, UnknownVersion
+from privacy_system import (
+    PrivacyGateway,
+    BudgetExhausted,
+    DuplicateRequest,
+    UnknownVersion,
+    REQUEST_NOT_RELEASED,
+    REQUEST_PENDING_DELIVERY,
+    REQUEST_DELIVERED,
+    REQUEST_BUDGET_EXHAUSTED,
+)
 from privacy_system.catalog import OPERATIONS
 from privacy_system.fictional_data import FICTIONAL_ROWS
 from privacy_system.mechanism import laplace_noise
@@ -230,6 +239,246 @@ class ConcurrencyTest(unittest.TestCase):
             persisted = json.load(handle)
         self.assertEqual(len(persisted["releases"]), 3)
         self.assertTrue(math.isclose(persisted["spent_epsilon"], 3.0))
+
+
+class SharedLedgerTest(unittest.TestCase):
+    """两个发布实例（含独立进程）共用一份账本时的一致性。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "ledger.json")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _gateway(self, seed: int = 7) -> PrivacyGateway:
+        gw = PrivacyGateway(self.db_path, total_epsilon=5.0, rng=random.Random(seed))
+        self.addCleanup(gw.close)
+        gw.register_fictional_v1()
+        return gw
+
+    def test_second_instance_replays_same_fact(self) -> None:
+        gw1 = self._gateway(seed=1)
+        first = gw1.release("shared", "fictional-v1", "count_all", {}, epsilon=1.0)
+
+        # 第二个实例使用完全不同的随机源：相同请求必须拿到同一份发布事实。
+        gw2 = self._gateway(seed=999)
+        second = gw2.release("shared", "fictional-v1", "count_all", {}, epsilon=1.0)
+        self.assertTrue(second.is_replay)
+        self.assertEqual(second.value, first.value)
+        self.assertEqual(second.epsilon_spent, 0.0)
+        self.assertTrue(math.isclose(gw2.budget()["spent_epsilon"], 1.0))
+
+        # 交错发起各自独立的新发布，两个实例看到同一份不断增长的账本。
+        gw1.release("a", "fictional-v1", "count_all", {}, epsilon=1.0)
+        gw2.release("b", "fictional-v1", "count_all", {}, epsilon=1.0)
+        gw1.release("c", "fictional-v1", "count_all", {}, epsilon=1.0)
+        self.assertTrue(math.isclose(gw1.budget()["spent_epsilon"], 4.0))
+        self.assertTrue(math.isclose(gw2.budget()["spent_epsilon"], 4.0))
+        ids = {row["request_id"] for row in gw1.list_releases()}
+        self.assertEqual(ids, {"shared", "a", "b", "c"})
+        # 第 5 个 ε 在两个实例上都应被拒绝（剩余 1.0，申请 1.5）。
+        with self.assertRaises(BudgetExhausted):
+            gw1.release("d", "fictional-v1", "count_all", {}, epsilon=1.5)
+        with self.assertRaises(BudgetExhausted):
+            gw2.release("e", "fictional-v1", "count_all", {}, epsilon=1.5)
+
+    def test_concurrent_instances_sharing_file_never_overspend(self) -> None:
+        # 两个独立网关实例（各自带锁与内存态）争用同一份账本的最后预算。
+        gw1 = PrivacyGateway(self.db_path, total_epsilon=2.0, rng=random.Random(1))
+        gw2 = PrivacyGateway(self.db_path, total_epsilon=2.0, rng=random.Random(2))
+        self.addCleanup(gw1.close)
+        self.addCleanup(gw2.close)
+        gw1.register_fictional_v1()
+        gw2.register_fictional_v1()
+
+        outcomes: list[str] = []
+        outcomes_lock = threading.Lock()
+
+        def worker(gw: PrivacyGateway, start: int) -> None:
+            for index in range(start, start + 6):
+                try:
+                    gw.release(
+                        f"x-{index}", "fictional-v1", "count_all", {}, epsilon=1.0
+                    )
+                    outcome = "ok"
+                except Exception:
+                    outcome = "rejected"
+                with outcomes_lock:
+                    outcomes.append(outcome)
+
+        threads = [
+            threading.Thread(target=worker, args=(gw1, 0)),
+            threading.Thread(target=worker, args=(gw2, 100)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(outcomes.count("ok"), 2)
+        self.assertTrue(math.isclose(gw1.budget()["spent_epsilon"], 2.0))
+        self.assertTrue(math.isclose(gw2.budget()["spent_epsilon"], 2.0))
+        with open(self.db_path, encoding="utf-8") as handle:
+            persisted = json.load(handle)
+        self.assertTrue(math.isclose(persisted["spent_epsilon"], 2.0))
+        self.assertEqual(len(persisted["releases"]), 2)
+
+    def test_cross_process_same_request_is_one_fact(self) -> None:
+        script = (
+            "import random, sys;\n"
+            "from privacy_system import PrivacyGateway;\n"
+            f"gw = PrivacyGateway({self.db_path!r}, total_epsilon=5.0, "
+            "rng=random.Random(int(sys.argv[2])));\n"
+            "gw.register_fictional_v1();\n"
+            "r = gw.release('proc', 'fictional-v1', 'count_all', {}, epsilon=1.0);\n"
+            "print(f'{r.value:.17f}:{int(r.is_replay)}');\n"
+        )
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, PYTHONPATH=root)
+        out1 = subprocess.run(
+            [sys.executable, "-c", script, self.db_path, "1"],
+            capture_output=True, text=True, check=True, cwd=root, env=env,
+        ).stdout.strip()
+        out2 = subprocess.run(
+            [sys.executable, "-c", script, self.db_path, "2"],
+            capture_output=True, text=True, check=True, cwd=root, env=env,
+        ).stdout.strip()
+        value1, replay1 = out1.rsplit(":", 1)
+        value2, replay2 = out2.rsplit(":", 1)
+        self.assertEqual(replay1, "0")
+        self.assertEqual(replay2, "1")
+        self.assertEqual(value1, value2)
+        with open(self.db_path, encoding="utf-8") as handle:
+            persisted = json.load(handle)
+        self.assertTrue(math.isclose(persisted["spent_epsilon"], 1.0))
+        self.assertEqual(len(persisted["releases"]), 1)
+
+    def test_cross_process_concurrent_never_overspend(self) -> None:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = (
+            "import os, random, sys;\n"
+            "from privacy_system import PrivacyGateway, BudgetExhausted;\n"
+            f"gw = PrivacyGateway({self.db_path!r}, total_epsilon=3.0, "
+            "rng=random.Random(0));\n"
+            "gw.register_fictional_v1();\n"
+            "tag = sys.argv[2];\n"
+            "for i in range(8):\n"
+            "    try:\n"
+            "        gw.release(f'{tag}-{i}', 'fictional-v1', 'count_all', {}, epsilon=1.0);\n"
+            "        print('ok', flush=True);\n"
+            "    except BudgetExhausted:\n"
+            "        print('rejected', flush=True);\n"
+        )
+        env = dict(os.environ, PYTHONPATH=root)
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, self.db_path, tag],
+                stdout=subprocess.PIPE, text=True, cwd=root, env=env,
+            )
+            for tag in ("p1", "p2")
+        ]
+        combined = []
+        for proc in procs:
+            stdout, _stderr = proc.communicate()
+            self.assertEqual(proc.returncode, 0)
+            combined.extend(stdout.split())
+        self.assertEqual(combined.count("ok"), 3)
+        self.assertEqual(combined.count("rejected"), 13)
+        with open(self.db_path, encoding="utf-8") as handle:
+            persisted = json.load(handle)
+        self.assertTrue(math.isclose(persisted["spent_epsilon"], 3.0))
+        self.assertEqual(len(persisted["releases"]), 3)
+
+
+class RequestLifecycleTest(unittest.TestCase):
+    """提交中途退出后的查询与接续、持久化预算不足。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "ledger.json")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _gateway(self, total: float = 10.0, seed: int = 3) -> PrivacyGateway:
+        gw = PrivacyGateway(self.db_path, total_epsilon=total, rng=random.Random(seed))
+        self.addCleanup(gw.close)
+        gw.register_fictional_v1()
+        return gw
+
+    def test_status_transitions_not_released_pending_delivered(self) -> None:
+        gw = self._gateway()
+        self.assertEqual(gw.request_status("r1"), REQUEST_NOT_RELEASED)
+        result = gw.release("r1", "fictional-v1", "count_all", {}, epsilon=1.0)
+        self.assertTrue(result.delivered)
+        self.assertEqual(gw.request_status("r1"), REQUEST_DELIVERED)
+
+    def test_crash_after_commit_query_and_resume(self) -> None:
+        gw1 = self._gateway(seed=5)
+        first = gw1.release("crash", "fictional-v1", "count_all", {}, epsilon=1.0)
+        # 模拟“落盘后、返回调用者前退出”：结果已扣账但调用者没收到。
+        gw1.mark_pending_delivery("crash")
+        self.assertEqual(gw1.request_status("crash"), REQUEST_PENDING_DELIVERY)
+        self.assertTrue(math.isclose(gw1.budget()["spent_epsilon"], 1.0))
+        gw1.close()
+
+        # 重新打开：发布事实与预算仍在，状态仍可区分“已发布未收到”。
+        gw2 = PrivacyGateway(self.db_path, total_epsilon=10.0, rng=random.Random(6))
+        self.addCleanup(gw2.close)
+        gw2.register_fictional_v1()
+        self.assertEqual(gw2.request_status("crash"), REQUEST_PENDING_DELIVERY)
+        self.assertTrue(math.isclose(gw2.budget()["spent_epsilon"], 1.0))
+
+        # 接续而不是重新发布：同一公开值、不重新加噪、不再扣预算。
+        recovered = gw2.recover_release("crash")
+        self.assertTrue(recovered.is_replay)
+        self.assertEqual(recovered.value, first.value)
+        self.assertEqual(recovered.epsilon_spent, 0.0)
+        self.assertTrue(math.isclose(gw2.budget()["spent_epsilon"], 1.0))
+        self.assertEqual(gw2.request_status("crash"), REQUEST_DELIVERED)
+
+        # 普通重试同样幂等地返回同一事实。
+        retry = gw2.release("crash", "fictional-v1", "count_all", {}, epsilon=1.0)
+        self.assertTrue(retry.is_replay)
+        self.assertEqual(retry.value, first.value)
+        self.assertTrue(math.isclose(gw2.budget()["spent_epsilon"], 1.0))
+
+    def test_recover_unknown_and_pending_after_restart(self) -> None:
+        gw = self._gateway()
+        with self.assertRaises(KeyError):
+            gw.recover_release("never")
+        self.assertEqual(gw.request_status("never"), REQUEST_NOT_RELEASED)
+
+    def test_budget_exhausted_is_persisted_and_distinct(self) -> None:
+        gw1 = self._gateway(total=1.0)
+        gw1.release("fit", "fictional-v1", "count_all", {}, epsilon=1.0)
+        with self.assertRaises(BudgetExhausted):
+            gw1.release("denied", "fictional-v1", "count_all", {}, epsilon=1.0)
+        self.assertEqual(gw1.request_status("denied"), REQUEST_BUDGET_EXHAUSTED)
+        # 预算不足的请求不在公开结果列表中，也没有扣预算。
+        self.assertEqual({r["request_id"] for r in gw1.list_releases()}, {"fit"})
+        self.assertTrue(math.isclose(gw1.budget()["spent_epsilon"], 1.0))
+        gw1.close()
+
+        # 重开后状态仍为“预算不足”，重试得到同样的持久化拒绝而非新结果。
+        gw2 = PrivacyGateway(self.db_path, total_epsilon=1.0, rng=random.Random(8))
+        self.addCleanup(gw2.close)
+        gw2.register_fictional_v1()
+        self.assertEqual(gw2.request_status("denied"), REQUEST_BUDGET_EXHAUSTED)
+        with self.assertRaises(BudgetExhausted):
+            gw2.release("denied", "fictional-v1", "count_all", {}, epsilon=1.0)
+        with self.assertRaises(BudgetExhausted):
+            gw2.recover_release("denied")
+        self.assertEqual({r["request_id"] for r in gw2.list_releases()}, {"fit"})
+        self.assertTrue(math.isclose(gw2.budget()["spent_epsilon"], 1.0))
+
+    def test_request_status_outputs_no_true_count_or_noise(self) -> None:
+        gw = self._gateway()
+        gw.release("s1", "fictional-v1", "count_by_city", {"city": "Beijing"}, epsilon=1.0)
+        status = gw.request_status("s1")
+        self.assertNotIn("noise", status)
+        self.assertNotIn("true", status)
 
 
 class PublicSurfaceTest(unittest.TestCase):

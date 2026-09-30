@@ -5,7 +5,14 @@
 """
 
 from .errors import BudgetExhausted, DuplicateRequest, PrivacySystemError, UnknownVersion
-from .gateway import PrivacyGateway, ReleaseResult
+from .gateway import (
+    PrivacyGateway,
+    ReleaseResult,
+    REQUEST_BUDGET_EXHAUSTED,
+    REQUEST_DELIVERED,
+    REQUEST_NOT_RELEASED,
+    REQUEST_PENDING_DELIVERY,
+)
 from .mechanism import laplace_noise
 
 __all__ = [
@@ -16,4 +23,9 @@ __all__ = [
     "BudgetExhausted",
     "DuplicateRequest",
     "UnknownVersion",
+    # 请求生命周期状态（详见 PrivacyGateway.request_status）。
+    "REQUEST_NOT_RELEASED",
+    "REQUEST_PENDING_DELIVERY",
+    "REQUEST_DELIVERED",
+    "REQUEST_BUDGET_EXHAUSTED",
 ]
