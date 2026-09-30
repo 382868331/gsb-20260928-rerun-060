@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import random
+import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Any
@@ -38,14 +39,17 @@ def _utc_now() -> str:
 
 @dataclass(frozen=True)
 class ReleaseResult:
-    """一次发布的回执。``value`` 是带噪估计值，不是真实精确数量。"""
+    """一次发布的公开回执。``value`` 是带噪估计值，不是真实精确数量。
+
+    公开回执**不包含本次噪声**：若同时给出带噪值与噪声，
+    两者相减即可还原精确计数，因此噪声只留在内部账本中供审计。
+    """
 
     request_id: str
     version: str
     operation: str
     params: dict[str, str]
     value: float
-    noise: float
     mechanism: str
     epsilon_spent: float
     epsilon_remaining: float
@@ -81,6 +85,9 @@ class PrivacyGateway:
         self._rng = rng if rng is not None else random.Random()
         self._versions: dict[str, _Version] = {}
         self._ledger = FileLedger(db_path, total_epsilon, COMPOSITION)
+        # 串行化发布：并发下的查重、加噪与扣账必须作为一个整体执行，
+        # 否则两个相同 request_id 的并发请求可能都通过查重而重复扣账。
+        self._lock = threading.RLock()
 
     # ---------- 生命周期 ----------
 
@@ -188,6 +195,18 @@ class PrivacyGateway:
           不重新加噪，即“重复请求”；
         - 不同 ``request_id``：即使查询内容相同也算“新查询”，独立扣预算。
         """
+        with self._lock:
+            return self._release_locked(request_id, version, operation, params, epsilon=epsilon)
+
+    def _release_locked(
+        self,
+        request_id: str,
+        version: str,
+        operation: str,
+        params: dict[str, str] | None = None,
+        *,
+        epsilon: float = 1.0,
+    ) -> ReleaseResult:
         if not request_id or not isinstance(request_id, str):
             raise ValueError("request_id 必须是非空字符串")
         if epsilon <= 0:
@@ -247,7 +266,6 @@ class PrivacyGateway:
             operation=operation,
             params=params,
             value=noisy_value,
-            noise=noise,
             mechanism=MECHANISM,
             epsilon_spent=epsilon,
             epsilon_remaining=total_before - spent_before - epsilon,
@@ -270,7 +288,6 @@ class PrivacyGateway:
             operation=prior["operation"],
             params=dict(prior["params"]),
             value=prior["noisy_value"],
-            noise=prior["noise"],
             mechanism=prior["mechanism"],
             epsilon_spent=0.0,
             epsilon_remaining=float(budget["remaining_epsilon"]),
@@ -280,7 +297,11 @@ class PrivacyGateway:
         )
 
     def list_releases(self) -> list[dict[str, Any]]:
-        """审计视图：只暴露带噪发布记录，原始真实计数不外泄。"""
+        """公开发布列表：只暴露带噪值，不暴露噪声与真实计数。
+
+        若同时给出带噪值与噪声，两者相减即还原精确计数，
+        因此噪声字段只保留在内部账本中（见 :meth:`audit_release`）。
+        """
         return [
             {
                 "request_id": rid,
@@ -288,7 +309,6 @@ class PrivacyGateway:
                 "operation": record["operation"],
                 "params": dict(record["params"]),
                 "noisy_value": record["noisy_value"],
-                "noise": record["noise"],
                 "epsilon": record["epsilon"],
                 "mechanism": record["mechanism"],
                 "created_at": record["created_at"],
@@ -297,3 +317,24 @@ class PrivacyGateway:
                 self._ledger.state["releases"].items(), key=lambda kv: kv[1]["created_at"]
             )
         ]
+
+    def audit_release(self, request_id: str) -> dict[str, Any]:
+        """**仅供内部审计**查看单次发布的完整依据（含真实计数与噪声）。
+
+        该信息足以还原精确计数，禁止向查询者暴露或写入任何对外输出。
+        """
+        record = self._ledger.state["releases"].get(request_id)
+        if record is None:
+            raise KeyError(f"不存在发布记录: {request_id!r}")
+        return {
+            "request_id": request_id,
+            "version": record["version"],
+            "operation": record["operation"],
+            "params": dict(record["params"]),
+            "true_count": record["true_count"],
+            "noise": record["noise"],
+            "noisy_value": record["noisy_value"],
+            "epsilon": record["epsilon"],
+            "mechanism": record["mechanism"],
+            "created_at": record["created_at"],
+        }

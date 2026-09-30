@@ -50,22 +50,25 @@ class FileLedger:
         """在一份深拷贝上执行变更；成功后整体原子落盘。
 
         ``mutate`` 抛异常则放弃全部修改（余额与发布记录都不变）。
+        先完成落盘再替换内存态：若落盘失败（如磁盘错误、进程被杀），
+        内存与磁盘都保持提交前状态，不会出现“内存已扣账但磁盘丢失”。
         """
         import copy
 
         candidate = copy.deepcopy(self._state)
         result = mutate(candidate)
-        self._state = candidate
         if not self.in_memory:
-            self._flush()
+            self._flush(candidate)
+        self._state = candidate
         return result
 
-    def _flush(self) -> None:
+    def _flush(self, state: dict[str, Any] | None = None) -> None:
+        state = self._state if state is None else state
         directory = os.path.dirname(os.path.abspath(self.path))
         fd, tmp_name = tempfile.mkstemp(prefix=".ledger-", suffix=".tmp", dir=directory)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(self._state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp_name, self.path)

@@ -44,7 +44,7 @@ def main() -> None:
             print(
                 f"[{request_id}] {operation}({params}) {kind}: "
                 f"带噪结果={result.value:.4f}（非真实精确值）, "
-                f"噪声={result.noise:.4f}, 剩余ε={result.epsilon_remaining:g}"
+                f"剩余ε={result.epsilon_remaining:g}"
             )
         print("最终预算:", gw.budget())
 
