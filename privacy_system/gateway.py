@@ -4,18 +4,19 @@
 ---------
 1. 原始数据只在网关进程内通过数据版本号间接访问，调用方拿不到原始行；
 2. 所有统计操作（第一版为有限种计数）都必须走 :meth:`PrivacyGateway.release`，
-   发布与扣预算在同一个 SQLite 事务中完成，要么同时成功要么同时回滚；
+   发布与扣预算在同一次文件锁保护的原子提交中完成，要么同时成功要么同时回滚；
 3. 预算合成规则为顺序组合（sequential composition）：总 ε 预算固定，
    每次发布按该次 ε 累减，剩余不足则拒绝，不产生任何结果也不扣预算；
 4. 重复请求（相同 ``request_id``）幂等返回首次发布结果，不再扣预算；
    新查询（不同 ``request_id``）即使参数完全相同也视为独立新发布并扣预算；
-5. 已提交事务在磁盘持久化（``fsync`` 由 SQLite 保证），重启后
-   预算账与已发布结果仍在，因此不会重复发放。
+5. 公开账本只保存带噪结果；真实计数与本次噪声保存在独立私有审计文件中；
+6. 已提交记录在磁盘持久化，重启后预算账与已发布结果仍在，因此不会重复发放。
 """
 
 from __future__ import annotations
 
 import json
+import math
 import random
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -24,7 +25,7 @@ from typing import Any
 from . import catalog
 from .errors import BudgetExhausted, DuplicateRequest, UnknownVersion
 from .fictional_data import fictional_dataset
-from .ledger import FileLedger
+from .ledger import AuditLog, FileLedger
 from .mechanism import laplace_noise
 
 MECHANISM = "laplace"
@@ -45,7 +46,6 @@ class ReleaseResult:
     operation: str
     params: dict[str, str]
     value: float
-    noise: float
     mechanism: str
     epsilon_spent: float
     epsilon_remaining: float
@@ -81,11 +81,14 @@ class PrivacyGateway:
         self._rng = rng if rng is not None else random.Random()
         self._versions: dict[str, _Version] = {}
         self._ledger = FileLedger(db_path, total_epsilon, COMPOSITION)
+        audit_path = None if db_path == ":memory:" else db_path + ".private-audit.json"
+        self._audit = AuditLog(audit_path)
 
     # ---------- 生命周期 ----------
 
     def close(self) -> None:
-        pass
+        self._ledger.close()
+        self._audit.close()
 
     def __enter__(self) -> "PrivacyGateway":
         return self
@@ -202,18 +205,19 @@ class PrivacyGateway:
                 f"版本 {version!r} 的原始数据不在本进程内存中，请重新注册（账本记录仍有效）"
             )
 
-        # 先查重：重复请求直接重放，绝不再次扣预算。
-        prior = self._ledger.state["releases"].get(request_id)
-        if prior is not None:
-            return self._replay(request_id, version, params, prior)
-
         true_count = op.compute(self._versions[version].data, params)
         created_at = _utc_now()
         noise: float | None = None
+        outcome: dict[str, Any] | None = None
 
-        # 发布与扣账在同一次原子提交中：余额不足时整体放弃，结果不会发出。
         def _apply(state: dict[str, Any]) -> None:
-            nonlocal noise
+            nonlocal noise, outcome
+            prior = state["releases"].get(request_id)
+            if prior is not None:
+                self._validate_replay(request_id, version, operation, params, epsilon, prior)
+                outcome = {"replay": True, "record": prior}
+                return
+
             total = state["total_epsilon"]
             spent = state["spent_epsilon"]
             remaining = total - spent
@@ -222,65 +226,72 @@ class PrivacyGateway:
                     f"预算不足：本次需要 epsilon={epsilon:g}，剩余 {remaining:g}（总额 {total:g}）"
                 )
             noise = laplace_noise(self._rng, op.sensitivity, epsilon)
-            state["spent_epsilon"] = spent + epsilon
-            state["releases"][request_id] = {
+            noisy_value = float(true_count) + noise
+            public_record = {
                 "version": version,
                 "operation": operation,
                 "params": params,
-                "true_count": true_count,
-                "noise": noise,
-                "noisy_value": float(true_count) + noise,
+                "noisy_value": noisy_value,
                 "epsilon": epsilon,
                 "mechanism": MECHANISM,
                 "created_at": created_at,
             }
+            audit_record = {
+                **public_record,
+                "request_id": request_id,
+                "true_count": true_count,
+                "noise": noise,
+            }
+            self._audit.put_release(audit_record)
+            state["spent_epsilon"] = spent + epsilon
+            state["releases"][request_id] = public_record
+            outcome = {"replay": False, "record": public_record}
 
-        total_before = self._ledger.state["total_epsilon"]
-        spent_before = self._ledger.state["spent_epsilon"]
-        self._ledger.commit(_apply)
-        assert noise is not None
-        noisy_value = float(true_count) + noise
+        try:
+            self._ledger.commit(_apply)
+        except BaseException:
+            if request_id not in self._ledger.state["releases"]:
+                self._audit.remove_release(request_id)
+            raise
+        assert outcome is not None
+        record = outcome["record"]
+        is_replay = bool(outcome["replay"])
 
         return ReleaseResult(
             request_id=request_id,
-            version=version,
-            operation=operation,
-            params=params,
-            value=noisy_value,
-            noise=noise,
-            mechanism=MECHANISM,
-            epsilon_spent=epsilon,
-            epsilon_remaining=total_before - spent_before - epsilon,
+            version=record["version"],
+            operation=record["operation"],
+            params=dict(record["params"]),
+            value=record["noisy_value"],
+            mechanism=record["mechanism"],
+            epsilon_spent=0.0 if is_replay else epsilon,
+            epsilon_remaining=float(self.budget()["remaining_epsilon"]),
             delta=DELTA,
-            is_replay=False,
-            created_at=created_at,
+            is_replay=is_replay,
+            created_at=record["created_at"],
         )
 
-    def _replay(
-        self, request_id: str, version: str, params: dict[str, str], prior: tuple
-    ) -> ReleaseResult:
-        if prior["version"] != version or prior["params"] != params:
+    def _validate_replay(
+        self,
+        request_id: str,
+        version: str,
+        operation: str,
+        params: dict[str, str],
+        epsilon: float,
+        prior: dict[str, Any],
+    ) -> None:
+        if (
+            prior["version"] != version
+            or prior["operation"] != operation
+            or prior["params"] != params
+            or not math.isclose(float(prior["epsilon"]), float(epsilon), rel_tol=0.0, abs_tol=1e-12)
+        ):
             raise DuplicateRequest(
-                f"request_id={request_id!r} 已用于不同的发布参数，拒绝执行"
+                "request_id 已用于不同的发布请求，拒绝执行"
             )
-        budget = self.budget()
-        return ReleaseResult(
-            request_id=request_id,
-            version=prior["version"],
-            operation=prior["operation"],
-            params=dict(prior["params"]),
-            value=prior["noisy_value"],
-            noise=prior["noise"],
-            mechanism=prior["mechanism"],
-            epsilon_spent=0.0,
-            epsilon_remaining=float(budget["remaining_epsilon"]),
-            delta=DELTA,
-            is_replay=True,
-            created_at=prior["created_at"],
-        )
 
     def list_releases(self) -> list[dict[str, Any]]:
-        """审计视图：只暴露带噪发布记录，原始真实计数不外泄。"""
+        """公开发布列表：只暴露带噪结果与非敏感发布元数据。"""
         return [
             {
                 "request_id": rid,
@@ -288,7 +299,6 @@ class PrivacyGateway:
                 "operation": record["operation"],
                 "params": dict(record["params"]),
                 "noisy_value": record["noisy_value"],
-                "noise": record["noise"],
                 "epsilon": record["epsilon"],
                 "mechanism": record["mechanism"],
                 "created_at": record["created_at"],
@@ -297,3 +307,10 @@ class PrivacyGateway:
                 self._ledger.state["releases"].items(), key=lambda kv: kv[1]["created_at"]
             )
         ]
+
+    def _audit_record(self, request_id: str) -> dict[str, Any]:
+        """返回私有审计证据；仅应在具备审计文件权限的内部环境调用。"""
+        record = self._audit.state["releases"].get(request_id)
+        if record is None:
+            raise KeyError(request_id)
+        return dict(record)

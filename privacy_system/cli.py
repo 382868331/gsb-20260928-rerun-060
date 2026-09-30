@@ -11,7 +11,7 @@ from .gateway import PrivacyGateway
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="隐私统计发布系统演示")
-    parser.add_argument("--db", default="privacy_ledger.sqlite3", help="账本数据库路径")
+    parser.add_argument("--db", default="privacy_ledger.json", help="公开账本路径")
     parser.add_argument("--total-epsilon", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=20260929, help="加噪随机源种子")
     args = parser.parse_args()
@@ -44,7 +44,7 @@ def main() -> None:
             print(
                 f"[{request_id}] {operation}({params}) {kind}: "
                 f"带噪结果={result.value:.4f}（非真实精确值）, "
-                f"噪声={result.noise:.4f}, 剩余ε={result.epsilon_remaining:g}"
+                f"剩余ε={result.epsilon_remaining:g}"
             )
         print("最终预算:", gw.budget())
 
