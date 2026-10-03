@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import random
 import threading
 from dataclasses import dataclass, asdict
@@ -45,6 +46,19 @@ STATUS_UNKNOWN = "not_released"        # 账本中没有该请求：尚未发布
 STATUS_PUBLISHED = "published"        # 已发布且调用者已至少收到一次回执
 STATUS_DELIVERED_UNKNOWN = "published_unacknowledged"  # 已发布，但尚无证据已送达
 
+MODE_ALL = "all_at_once"
+MODE_PHASED = "phased"
+
+PLAN_APPROVED = "approved"
+PLAN_FULFILLED = "fulfilled"
+PLAN_PARTIAL = "partial"
+PLAN_CANCELED = "canceled"
+
+ITEM_APPROVED = "approved"
+ITEM_PUBLISHED = "published"
+ITEM_CLAIMED = "claimed"
+ITEM_CANCELED = "canceled"
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -69,9 +83,28 @@ class ReleaseResult:
     delta: float
     is_replay: bool
     created_at: str
+    arrangement_id: str | None = None
+    item_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _statistical_identity(
+    version: str, fingerprint: str, operation: str, params: dict[str, str]
+) -> str:
+    """由数据版本、操作和完整筛选条件确定统计身份；显示名不参与身份。"""
+    payload = json.dumps(
+        {
+            "version": version,
+            "fingerprint": fingerprint,
+            "operation": operation,
+            "params": params,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return "stat-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
 @dataclass(frozen=True)
@@ -274,6 +307,12 @@ class PrivacyGateway:
             noise = laplace_noise(self._rng, op.sensitivity, epsilon)
             record = {
                 "version": version,
+                "identity": _statistical_identity(
+                    version,
+                    self._versions[version].fingerprint,
+                    operation,
+                    params,
+                ),
                 "operation": operation,
                 "params": params,
                 "true_count": true_count,
@@ -285,9 +324,27 @@ class PrivacyGateway:
                 # delivered=False 表示“已发布、已扣预算，但尚无证据调用者已收到”。
                 # 与 noisy_value/true_count/noise 在同一次原子提交里写入。
                 "delivered": False,
+                "arrangement_id": None,
+                "item_id": None,
+                "source_request_id": request_id,
+                "reusable": True,
             }
             state["spent_epsilon"] = spent + epsilon
             state["releases"][request_id] = record
+            state["budget_events"].append(
+                {
+                    "event_id": f"event-{len(state['budget_events']) + 1}",
+                    "at": record["created_at"],
+                    "kind": "release",
+                    "arrangement_id": None,
+                    "item_id": None,
+                    "request_id": request_id,
+                    "stat_identity": record["identity"],
+                    "epsilon": epsilon,
+                    "source_request_id": request_id,
+                    "reason": "direct_release",
+                }
+            )
             outcome["kind"] = "new"
             outcome["record"] = record
             # 仅当本次确实完成了一笔新发布时，才触发一次性的“送达前中断”。
@@ -325,6 +382,8 @@ class PrivacyGateway:
             delta=DELTA,
             is_replay=is_replay,
             created_at=record["created_at"],
+            arrangement_id=record.get("arrangement_id"),
+            item_id=record.get("item_id"),
         )
 
     def _mark_delivered(self, request_id: str) -> None:
@@ -395,7 +454,501 @@ class PrivacyGateway:
             delta=DELTA,
             is_replay=True,
             created_at=record["created_at"],
+            arrangement_id=record.get("arrangement_id"),
+            item_id=record.get("item_id"),
         )
+
+    # ---------- 发布安排：预演、批准、兑现与领取 ----------
+
+    def preview_arrangement(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        mode: str = MODE_ALL,
+    ) -> dict[str, Any]:
+        """预演一组统计的预算去向；不落盘、不批准、不抽噪声、不产生结果。"""
+        normalized = self._normalize_items(items)
+        self._validate_mode(mode)
+        state = self._ledger.snapshot()
+        preview_items = []
+        total_new_epsilon = 0.0
+        total_reused_epsilon = 0.0
+
+        for item in normalized:
+            identity = _statistical_identity(
+                item["version"],
+                self._versions[item["version"]].fingerprint,
+                item["operation"],
+                item["params"],
+            )
+            source = self._find_release(state, identity)
+            if source is None:
+                budget_action = "new_release"
+                source_request_id = None
+                charged_here = item["epsilon"]
+                charged_before = 0.0
+                total_new_epsilon += item["epsilon"]
+            else:
+                budget_action = "reuse_existing_release"
+                source_request_id = source[0]
+                charged_here = 0.0
+                charged_before = source[1]["epsilon"]
+                total_reused_epsilon += source[1]["epsilon"]
+            preview_items.append(
+                {
+                    "item_id": item["item_id"],
+                    "label": item["label"],
+                    "stat_identity": identity,
+                    "version": item["version"],
+                    "data_fingerprint": self._versions[item["version"]].fingerprint,
+                    "operation": item["operation"],
+                    "params": item["params"],
+                    "existing_release_request_id": source_request_id,
+                    "budget_action": budget_action,
+                    "epsilon_requested": item["epsilon"],
+                    "epsilon_charged_in_this_arrangement": charged_here,
+                    "epsilon_already_charged_by_existing_release": charged_before,
+                }
+            )
+
+        return {
+            "mode": mode,
+            "items": preview_items,
+            "new_epsilon_required": total_new_epsilon,
+            "existing_release_epsilon_reused": total_reused_epsilon,
+            "remaining_epsilon_now": state["total_epsilon"] - state["spent_epsilon"],
+            "would_fit_atomic_all_at_once": total_new_epsilon
+            <= state["total_epsilon"] - state["spent_epsilon"] + 1e-12,
+            "approved": False,
+        }
+
+    def approve_arrangement(
+        self,
+        arrangement_id: str,
+        items: list[dict[str, Any]],
+        *,
+        mode: str = MODE_ALL,
+    ) -> dict[str, Any]:
+        """批准并冻结安排；此时仍不抽噪声、不发布结果，也不预留预算。"""
+        if not arrangement_id or not isinstance(arrangement_id, str):
+            raise ValueError("arrangement_id 必须是非空字符串")
+        normalized = self._normalize_items(items)
+        self._validate_mode(mode)
+        identities = {
+            _statistical_identity(
+                item["version"],
+                self._versions[item["version"]].fingerprint,
+                item["operation"],
+                item["params"],
+            )
+            for item in normalized
+        }
+        if len(identities) != len(normalized):
+            raise ValueError("同一安排内不能重复登记同一统计身份")
+
+        def _apply(state: dict[str, Any]) -> dict[str, Any]:
+            existing = state["arrangements"].get(arrangement_id)
+            if existing is not None:
+                if existing["mode"] != mode or not self._same_item_specs(
+                    existing["items"], normalized
+                ):
+                    raise DuplicateRequest(
+                        f"arrangement_id={arrangement_id!r} 已用于不同安排，拒绝复用"
+                    )
+                return existing
+            arrangement = {
+                "arrangement_id": arrangement_id,
+                "mode": mode,
+                "status": PLAN_APPROVED,
+                "approved_at": _utc_now(),
+                "items": self._stored_items(normalized),
+            }
+            state["arrangements"][arrangement_id] = arrangement
+            return arrangement
+
+        return self._public_arrangement(self._ledger.commit(_apply))
+
+    def fulfill_arrangement(self, arrangement_id: str) -> dict[str, Any]:
+        """整组兑现：整组新增预算不足时原子失败，不产生任何一项新发布。"""
+        with self._lock:
+            def _apply(state: dict[str, Any]) -> dict[str, Any]:
+                arrangement = self._require_arrangement(state, arrangement_id)
+                if arrangement["mode"] != MODE_ALL:
+                    raise ValueError("分阶段安排必须调用 fulfill_arrangement_item()")
+                if arrangement["status"] != PLAN_APPROVED:
+                    raise ValueError(f"安排当前状态为 {arrangement['status']!r}，不能整组兑现")
+                self._ensure_item_identities(state, arrangement)
+                needed = sum(
+                    item["epsilon"]
+                    for item in arrangement["items"]
+                    if self._find_release(state, item["identity"]) is None
+                )
+                remaining = state["total_epsilon"] - state["spent_epsilon"]
+                if needed > remaining + 1e-12:
+                    raise BudgetExhausted(
+                        f"整组预算不足：新增需要 epsilon={needed:g}，剩余 {remaining:g}"
+                    )
+                for item in arrangement["items"]:
+                    self._publish_item(state, arrangement, item)
+                arrangement["status"] = PLAN_FULFILLED
+                return arrangement
+
+            return self._public_arrangement(self._ledger.commit(_apply))
+
+    def fulfill_arrangement_item(self, arrangement_id: str, item_id: str) -> dict[str, Any]:
+        """兑现分阶段安排中的一项；已发布部分不会因后续失败或取消而回滚。"""
+        with self._lock:
+            def _apply(state: dict[str, Any]) -> dict[str, Any]:
+                arrangement = self._require_arrangement(state, arrangement_id)
+                if arrangement["mode"] != MODE_PHASED:
+                    raise ValueError("整组安排不能逐项兑现")
+                if arrangement["status"] == PLAN_CANCELED:
+                    raise ValueError("安排已取消，不能继续兑现")
+                self._ensure_item_identities(state, arrangement)
+                item = self._require_item(arrangement, item_id)
+                if item["status"] != ITEM_APPROVED:
+                    return arrangement
+                source = self._find_release(state, item["identity"])
+                needed = 0.0 if source is not None else item["epsilon"]
+                remaining = state["total_epsilon"] - state["spent_epsilon"]
+                if needed > remaining + 1e-12:
+                    raise BudgetExhausted(
+                        f"该统计新增预算不足：需要 epsilon={needed:g}，剩余 {remaining:g}"
+                    )
+                self._publish_item(state, arrangement, item)
+                arrangement["status"] = (
+                    PLAN_FULFILLED
+                    if all(published["status"] != ITEM_APPROVED for published in arrangement["items"])
+                    else PLAN_PARTIAL
+                )
+                return arrangement
+
+            return self._public_arrangement(self._ledger.commit(_apply))
+
+    def claim_arrangement_item(
+        self, arrangement_id: str, item_id: str
+    ) -> ReleaseResult:
+        """领取一项已经兑现的结果；不重新加噪、不重复扣预算。"""
+        with self._lock:
+            def _apply(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+                arrangement = self._require_arrangement(state, arrangement_id)
+                item = self._require_item(arrangement, item_id)
+                if item["status"] in (ITEM_APPROVED, ITEM_CANCELED):
+                    raise ValueError("该统计尚未兑现，不能领取")
+                record = state["releases"][item["source_request_id"]]
+                item["status"] = ITEM_CLAIMED
+                record["delivered"] = True
+                return arrangement, record
+
+            arrangement, record = self._ledger.commit(_apply)
+            return self._release_result_for(record)
+
+    def claim_arrangement(self, arrangement_id: str) -> list[ReleaseResult]:
+        """领取安排中所有已经兑现且尚未通过该安排领取的结果。"""
+        claimed = []
+        arrangement = self.get_arrangement(arrangement_id)
+        for item in arrangement["items"]:
+            if item["status"] in (ITEM_PUBLISHED, ITEM_CLAIMED) and item["status"] != ITEM_CLAIMED:
+                claimed.append(self.claim_arrangement_item(arrangement_id, item["item_id"]))
+        return claimed
+
+    def cancel_arrangement(self, arrangement_id: str) -> dict[str, Any]:
+        """取消安排；整组模式只能在兑现前取消，分阶段模式只取消未兑现项。"""
+        def _apply(state: dict[str, Any]) -> dict[str, Any]:
+            arrangement = self._require_arrangement(state, arrangement_id)
+            if arrangement["mode"] == MODE_ALL:
+                if arrangement["status"] != PLAN_APPROVED:
+                    raise ValueError("整组安排已兑现，发布事实和预算消耗永久保留")
+                arrangement["status"] = PLAN_CANCELED
+                for item in arrangement["items"]:
+                    item["status"] = ITEM_CANCELED
+            else:
+                for item in arrangement["items"]:
+                    if item["status"] == ITEM_APPROVED:
+                        item["status"] = ITEM_CANCELED
+                if all(item["status"] == ITEM_CANCELED for item in arrangement["items"]):
+                    arrangement["status"] = PLAN_CANCELED
+                elif any(item["status"] in (ITEM_PUBLISHED, ITEM_CLAIMED) for item in arrangement["items"]):
+                    arrangement["status"] = PLAN_PARTIAL
+            return arrangement
+
+        return self._public_arrangement(self._ledger.commit(_apply))
+
+    def get_arrangement(self, arrangement_id: str) -> dict[str, Any]:
+        return self._public_arrangement(
+            self._require_arrangement(self._ledger.snapshot(), arrangement_id)
+        )
+
+    def list_arrangements(self) -> list[dict[str, Any]]:
+        return [
+            self._public_arrangement(arrangement)
+            for arrangement in self._ledger.snapshot()["arrangements"].values()
+        ]
+
+    def public_audit_log(self) -> list[dict[str, Any]]:
+        """公开审计：只给发布事实对应的预算变化，不含精确统计或随机噪声。"""
+        return [dict(event) for event in self._ledger.snapshot()["budget_events"]]
+
+    def _normalize_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not isinstance(items, list) or not items:
+            raise ValueError("items 必须是非空列表")
+        normalized = []
+        seen_item_ids: set[str] = set()
+        for index, raw in enumerate(items):
+            if not isinstance(raw, dict):
+                raise ValueError("每个统计项必须是对象")
+            item_id = str(raw.get("item_id") or f"item-{index + 1}")
+            if item_id in seen_item_ids:
+                raise ValueError(f"统计项 ID 重复: {item_id!r}")
+            seen_item_ids.add(item_id)
+            version = raw.get("version")
+            operation = raw.get("operation")
+            params = dict(raw.get("params") or {})
+            epsilon = float(raw.get("epsilon", 1.0))
+            if not version or not isinstance(version, str):
+                raise ValueError("统计项的 version 必须是非空字符串")
+            if version not in self._versions:
+                raise UnknownVersion(
+                    f"版本 {version!r} 的原始数据不在本进程内存中，请重新注册（账本记录仍有效）"
+                )
+            if epsilon <= 0:
+                raise ValueError("每个统计项的 epsilon 必须为正数")
+            op = catalog.get_operation(operation)
+            op.validate_params(params)
+            fingerprint = self._versions[version].fingerprint
+            normalized.append(
+                {
+                    "item_id": item_id,
+                    "label": str(raw.get("label") or item_id),
+                    "version": version,
+                    "fingerprint": fingerprint,
+                    "operation": operation,
+                    "params": params,
+                    "epsilon": epsilon,
+                    "identity": _statistical_identity(
+                        version, fingerprint, operation, params
+                    ),
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _stored_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "item_id": item["item_id"],
+                "label": item["label"],
+                "version": item["version"],
+                "fingerprint": item["fingerprint"],
+                "operation": item["operation"],
+                "params": dict(item["params"]),
+                "epsilon": item["epsilon"],
+                "identity": item["identity"],
+                "status": ITEM_APPROVED,
+                "source_request_id": None,
+            }
+            for item in items
+        ]
+
+    @staticmethod
+    def _validate_mode(mode: str) -> None:
+        if mode not in (MODE_ALL, MODE_PHASED):
+            raise ValueError("mode 必须是 all_at_once 或 phased")
+
+    @staticmethod
+    def _same_item_specs(
+        existing_items: list[dict[str, Any]], requested_items: list[dict[str, Any]]
+    ) -> bool:
+        fields = (
+            "item_id",
+            "label",
+            "version",
+            "fingerprint",
+            "operation",
+            "params",
+            "epsilon",
+            "identity",
+        )
+        if len(existing_items) != len(requested_items):
+            return False
+        return all(
+            all(existing.get(field) == requested.get(field) for field in fields)
+            for existing, requested in zip(existing_items, requested_items)
+        )
+
+    @staticmethod
+    def _require_arrangement(state: dict[str, Any], arrangement_id: str) -> dict[str, Any]:
+        arrangement = state["arrangements"].get(arrangement_id)
+        if arrangement is None:
+            raise KeyError(f"不存在发布安排: {arrangement_id!r}")
+        return arrangement
+
+    @staticmethod
+    def _require_item(arrangement: dict[str, Any], item_id: str) -> dict[str, Any]:
+        for item in arrangement["items"]:
+            if item["item_id"] == item_id:
+                return item
+        raise KeyError(f"安排中不存在统计项: {item_id!r}")
+
+    def _ensure_item_identities(
+        self, state: dict[str, Any], arrangement: dict[str, Any]
+    ) -> None:
+        for item in arrangement["items"]:
+            if item.get("version") not in self._versions:
+                raise UnknownVersion(
+                    f"版本 {item.get('version')!r} 的原始数据不在本进程内存中，请重新注册"
+                )
+            expected = _statistical_identity(
+                item["version"],
+                self._versions[item["version"]].fingerprint,
+                item["operation"],
+                item["params"],
+            )
+            if item.setdefault("identity", expected) != expected:
+                raise ValueError("发布安排绑定的数据范围与当前版本不一致")
+
+    @staticmethod
+    def _find_release(
+        state: dict[str, Any], identity: str
+    ) -> tuple[str, dict[str, Any]] | None:
+        def record_identity(record: dict[str, Any]) -> str | None:
+            if record.get("identity"):
+                return record["identity"]
+            version_meta = state["versions"].get(record.get("version"))
+            if version_meta is None:
+                return None
+            return _statistical_identity(
+                record["version"],
+                version_meta["fingerprint"],
+                record["operation"],
+                record["params"],
+            )
+
+        matches = [
+            (request_id, record)
+            for request_id, record in state["releases"].items()
+            if record_identity(record) == identity
+        ]
+        if not matches:
+            return None
+        return sorted(matches, key=lambda pair: (pair[1]["created_at"], pair[0]))[0]
+
+    def _publish_item(
+        self,
+        state: dict[str, Any],
+        arrangement: dict[str, Any],
+        item: dict[str, Any],
+    ) -> None:
+        source = self._find_release(state, item["identity"])
+        if source is not None:
+            source_request_id, source_record = source
+            item["source_request_id"] = source_request_id
+            item["status"] = ITEM_PUBLISHED
+            state["budget_events"].append(
+                {
+                    "event_id": f"event-{len(state['budget_events']) + 1}",
+                    "at": _utc_now(),
+                    "kind": "reuse_existing_release",
+                    "arrangement_id": arrangement["arrangement_id"],
+                    "item_id": item["item_id"],
+                    "request_id": None,
+                    "stat_identity": item["identity"],
+                    "epsilon": 0.0,
+                    "source_request_id": source_request_id,
+                    "reason": "shared_statistical_identity",
+                }
+            )
+            return
+
+        request_id = f"{arrangement['arrangement_id']}:{item['item_id']}"
+        if request_id in state["releases"]:
+            raise DuplicateRequest(f"发布请求 ID 已存在: {request_id!r}")
+        version = item["version"]
+        operation = item["operation"]
+        params = dict(item["params"])
+        epsilon = item["epsilon"]
+        op = catalog.get_operation(operation)
+        true_count = op.compute(self._versions[version].data, params)
+        sensitivity = op.sensitivity
+        noise = laplace_noise(self._rng, sensitivity, epsilon)
+        created_at = _utc_now()
+        record = {
+            "version": version,
+            "identity": item["identity"],
+            "operation": operation,
+            "params": params,
+            "true_count": true_count,
+            "noise": noise,
+            "noisy_value": float(true_count) + noise,
+            "epsilon": epsilon,
+            "mechanism": MECHANISM,
+            "created_at": created_at,
+            "delivered": False,
+            "arrangement_id": arrangement["arrangement_id"],
+            "item_id": item["item_id"],
+            "source_request_id": request_id,
+            "reusable": True,
+        }
+        state["spent_epsilon"] += epsilon
+        state["releases"][request_id] = record
+        item["source_request_id"] = request_id
+        item["status"] = ITEM_PUBLISHED
+        state["budget_events"].append(
+            {
+                "event_id": f"event-{len(state['budget_events']) + 1}",
+                "at": created_at,
+                "kind": "arrangement_release",
+                "arrangement_id": arrangement["arrangement_id"],
+                "item_id": item["item_id"],
+                "request_id": request_id,
+                "stat_identity": item["identity"],
+                "epsilon": epsilon,
+                "source_request_id": request_id,
+                "reason": "new_statistical_release",
+            }
+        )
+
+    def _release_result_for(self, record: dict[str, Any]) -> ReleaseResult:
+        budget = self.budget()
+        return ReleaseResult(
+            request_id=record["source_request_id"],
+            version=record["version"],
+            operation=record["operation"],
+            params=dict(record["params"]),
+            value=record["noisy_value"],
+            mechanism=record["mechanism"],
+            epsilon_spent=0.0,
+            epsilon_remaining=float(budget["remaining_epsilon"]),
+            delta=DELTA,
+            is_replay=True,
+            created_at=record["created_at"],
+            arrangement_id=record.get("arrangement_id"),
+            item_id=record.get("item_id"),
+        )
+
+    @staticmethod
+    def _public_arrangement(arrangement: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "arrangement_id": arrangement["arrangement_id"],
+            "mode": arrangement["mode"],
+            "status": arrangement["status"],
+            "approved_at": arrangement["approved_at"],
+            "items": [
+                {
+                    "item_id": item["item_id"],
+                    "label": item["label"],
+                    "stat_identity": item.get("identity"),
+                    "version": item["version"],
+                    "data_fingerprint": item.get("fingerprint"),
+                    "operation": item["operation"],
+                    "params": dict(item["params"]),
+                    "epsilon": item["epsilon"],
+                    "status": item["status"],
+                    "source_request_id": item.get("source_request_id"),
+                }
+                for item in arrangement["items"]
+            ],
+        }
 
     # ---------- 故障注入（测试用） ----------
 

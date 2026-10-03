@@ -11,7 +11,12 @@ from .errors import (
     ReleaseInterrupted,
     UnknownVersion,
 )
-from .gateway import PrivacyGateway, ReleaseResult
+from .gateway import (
+    MODE_ALL,
+    MODE_PHASED,
+    PrivacyGateway,
+    ReleaseResult,
+)
 from .mechanism import laplace_noise
 
 __all__ = [
@@ -23,4 +28,6 @@ __all__ = [
     "BudgetExhausted",
     "DuplicateRequest",
     "UnknownVersion",
+    "MODE_ALL",
+    "MODE_PHASED",
 ]
