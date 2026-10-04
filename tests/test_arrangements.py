@@ -222,6 +222,89 @@ class ArrangementTest(unittest.TestCase):
         self.assertNotIn("noise", serialized)
         self.assertNotIn("noisy_value", serialized)
 
+    def test_group_claim_repeats_return_same_results_without_new_charge(self) -> None:
+        gw = self._gateway(total=3.0)
+        gw.approve_arrangement("group", self._items(), mode=MODE_ALL)
+        gw.fulfill_arrangement("group")
+        first = gw.claim_arrangement("group")
+        self.assertEqual([result.item_id for result in first], ["total", "beijing"])
+        self.assertEqual(
+            [result.request_id for result in first], ["group:total", "group:beijing"]
+        )
+        original_values = [result.value for result in first]
+        self.assertTrue(all(math.isclose(result.epsilon_spent, 0.0) for result in first))
+        gw.close()
+
+        reopened = PrivacyGateway(self.db_path, total_epsilon=3.0, rng=random.Random(4242))
+        self.addCleanup(reopened.close)
+        reopened.register_fictional_v1()
+        repeated = reopened.claim_arrangement("group")
+        self.assertEqual([result.value for result in repeated], original_values)
+        self.assertTrue(all(result.is_replay for result in repeated))
+        self.assertTrue(
+            all(math.isclose(result.epsilon_spent, 0.0) for result in repeated)
+        )
+        self.assertTrue(math.isclose(reopened.budget()["spent_epsilon"], 2.0))
+        self.assertEqual(
+            sorted(record["request_id"] for record in reopened.list_releases()),
+            ["group:beijing", "group:total"],
+        )
+
+    def test_phased_cancel_sharing_and_reopen_claims(self) -> None:
+        gw = self._gateway(total=1.2)
+        gw.approve_arrangement("phased", self._items(), mode=MODE_PHASED)
+        first_view = gw.fulfill_arrangement_item("phased", "total")
+        self.assertEqual(first_view["status"], "partial")
+        first_claim = gw.claim_arrangement_item("phased", "total")
+
+        with self.assertRaises(BudgetExhausted):
+            gw.fulfill_arrangement_item("phased", "beijing")
+        canceled = gw.cancel_arrangement("phased")
+        statuses = {item["item_id"]: item["status"] for item in canceled["items"]}
+        self.assertEqual(statuses, {"total": "claimed", "beijing": "canceled"})
+
+        gw.approve_arrangement("shared", self._items()[:1], mode=MODE_ALL)
+        shared_view = gw.fulfill_arrangement("shared")
+        shared_item = shared_view["items"][0]
+        self.assertEqual(shared_item["source_request_id"], "phased:total")
+        shared_claim = gw.claim_arrangement_item("shared", "total")
+        self.assertEqual(shared_claim.value, first_claim.value)
+        self.assertEqual(shared_claim.request_id, "phased:total")
+        self.assertTrue(math.isclose(shared_claim.epsilon_spent, 0.0))
+        self.assertTrue(math.isclose(gw.budget()["spent_epsilon"], 1.0))
+
+        group_claims = gw.claim_arrangement("phased")
+        self.assertEqual([result.item_id for result in group_claims], ["total"])
+        self.assertEqual(group_claims[0].value, first_claim.value)
+        with self.assertRaises(ValueError):
+            gw.claim_arrangement_item("phased", "beijing")
+        gw.close()
+
+        reopened = PrivacyGateway(self.db_path, total_epsilon=1.2, rng=random.Random(77))
+        self.addCleanup(reopened.close)
+        reopened.register_fictional_v1()
+        phased = reopened.get_arrangement("phased")
+        restarted_statuses = {
+            item["item_id"]: item["status"] for item in phased["items"]
+        }
+        self.assertEqual(
+            restarted_statuses, {"total": "claimed", "beijing": "canceled"}
+        )
+        restarted_claims = reopened.claim_arrangement("phased")
+        self.assertEqual(len(restarted_claims), 1)
+        self.assertEqual(restarted_claims[0].value, first_claim.value)
+        self.assertEqual(restarted_claims[0].request_id, "phased:total")
+        self.assertTrue(math.isclose(restarted_claims[0].epsilon_spent, 0.0))
+        shared_restarted = reopened.claim_arrangement("shared")
+        self.assertEqual(len(shared_restarted), 1)
+        self.assertEqual(shared_restarted[0].value, first_claim.value)
+        self.assertEqual(shared_restarted[0].request_id, "phased:total")
+        self.assertTrue(math.isclose(reopened.budget()["spent_epsilon"], 1.0))
+        self.assertEqual(
+            [record["request_id"] for record in reopened.list_releases()],
+            ["phased:total"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
