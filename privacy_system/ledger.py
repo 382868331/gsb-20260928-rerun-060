@@ -42,6 +42,7 @@ class FileLedger:
                 "composition": composition,
                 "versions": {},
                 "releases": {},
+                "plans": {},
             }
             return
         directory = os.path.dirname(os.path.abspath(path))
@@ -64,11 +65,14 @@ class FileLedger:
             "composition": composition,
             "versions": {},
             "releases": {},
+            "plans": {},
         }
 
     def _read_disk(self) -> dict[str, Any]:
         with open(self.path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
+            state = json.load(handle)
+        state.setdefault("plans", {})
+        return state
 
     @contextmanager
     def _locked(self):

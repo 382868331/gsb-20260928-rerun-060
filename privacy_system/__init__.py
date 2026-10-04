@@ -7,8 +7,10 @@
 from .errors import (
     BudgetExhausted,
     DuplicateRequest,
+    InvalidPlanState,
     PrivacySystemError,
     ReleaseInterrupted,
+    UnknownPlan,
     UnknownVersion,
 )
 from .gateway import PrivacyGateway, ReleaseResult
@@ -22,5 +24,7 @@ __all__ = [
     "ReleaseInterrupted",
     "BudgetExhausted",
     "DuplicateRequest",
+    "InvalidPlanState",
+    "UnknownPlan",
     "UnknownVersion",
 ]

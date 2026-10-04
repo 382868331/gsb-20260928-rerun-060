@@ -21,6 +21,14 @@ class UnknownOperation(PrivacySystemError):
     """操作未在隐私网关注册。"""
 
 
+class UnknownPlan(PrivacySystemError):
+    """引用了不存在的发布安排。"""
+
+
+class InvalidPlanState(PrivacySystemError):
+    """发布安排当前状态不允许该操作（如已取消或模式不符）。"""
+
+
 class ReleaseInterrupted(PrivacySystemError):
     """发布已原子提交落盘，但结果在返回调用者之前连接中断。
 

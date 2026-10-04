@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import threading
@@ -29,7 +30,9 @@ from . import catalog
 from .errors import (
     BudgetExhausted,
     DuplicateRequest,
+    InvalidPlanState,
     ReleaseInterrupted,
+    UnknownPlan,
     UnknownVersion,
 )
 from .fictional_data import fictional_dataset
@@ -44,6 +47,19 @@ DELTA = 0.0
 STATUS_UNKNOWN = "not_released"        # 账本中没有该请求：尚未发布
 STATUS_PUBLISHED = "published"        # 已发布且调用者已至少收到一次回执
 STATUS_DELIVERED_UNKNOWN = "published_unacknowledged"  # 已发布，但尚无证据已送达
+
+# 发布安排的兑现模式。
+PLAN_MODE_ATOMIC = "atomic"   # 整组一同兑现：预算不足则一项都不发布
+PLAN_MODE_STAGED = "staged"   # 分阶段逐项兑现：已发布部分永久保留，未发布部分可取消
+
+# 安排与其统计项的可观察状态。
+PLAN_STATUS_APPROVED = "approved"                  # 已批准，尚未兑现任何一项
+PLAN_STATUS_PARTIAL = "partially_fulfilled"        # 分阶段兑现中：部分已发布
+PLAN_STATUS_FULFILLED = "fulfilled"                # 全部统计项已发布
+PLAN_STATUS_CANCELLED = "cancelled"                # 未发布部分已取消（已发布部分保留）
+ITEM_PENDING = "pending"
+ITEM_FULFILLED = "fulfilled"
+ITEM_CANCELLED = "cancelled"
 
 
 def _utc_now() -> str:
@@ -127,8 +143,6 @@ class PrivacyGateway:
         description: str = "",
     ) -> str:
         """登记一个数据版本。原始数据不写入磁盘账本，只在内存中保留。"""
-        import hashlib
-
         payload = json.dumps(
             [list(data[0]), [dict(r) for r in data[1]]],
             sort_keys=True,
@@ -369,6 +383,453 @@ class PrivacyGateway:
             "mechanism": record["mechanism"],
             "created_at": record["created_at"],
         }
+
+    # ---------- 发布安排：预演 → 批准 → 兑现 → 领取 ----------
+    #
+    # 一个“发布安排”把一组相关统计绑定为一个整体：
+    #   1. preview_plan  预演：只给出统计身份、可共享的既有发布事实与预算去向，
+    #      不产生任何可领取结果，也不透露精确统计或随机噪声；
+    #   2. approve_plan  批准：把安排身份与批准时的数据版本（含指纹）一起入账，
+    #      之后到达的新数据属于新版本，必须另行研究产生独立安排；
+    #   3. fulfill_plan  兑现：atomic 整组一同发布（预算不足则一项都不发布），
+    #      staged 分阶段逐项发布（已发布部分永久保留，未发布部分可取消）；
+    #   4. claim_plan    领取：只返回已兑现项的公开结果。
+    #
+    # 安排身份 plan_id 由「数据版本 + 版本指纹 + 兑现模式 + 全部统计项
+    # （操作/参数/ε）」的哈希决定，与显示名称无关：改变筛选范围或统计含义
+    # 必然得到新身份，同名安排不会被复用。
+
+    @staticmethod
+    def _normalize_plan_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not items:
+            raise ValueError("发布安排至少需要一项统计")
+        normalized = []
+        for item in items:
+            operation = item.get("operation")
+            op = catalog.get_operation(operation)
+            params = dict(item.get("params") or {})
+            op.validate_params(params)
+            epsilon = float(item.get("epsilon", 1.0))
+            if epsilon <= 0:
+                raise ValueError("每项统计的 epsilon 必须为正数")
+            normalized.append(
+                {"operation": operation, "params": params, "epsilon": epsilon}
+            )
+        return normalized
+
+    @staticmethod
+    def _validate_plan_mode(mode: str) -> None:
+        if mode not in (PLAN_MODE_ATOMIC, PLAN_MODE_STAGED):
+            raise ValueError(f"未知兑现模式: {mode!r}（应为 atomic 或 staged）")
+
+    @staticmethod
+    def _plan_identity(
+        version: str, fingerprint: str, mode: str, items: list[dict[str, Any]]
+    ) -> str:
+        payload = json.dumps(
+            {
+                "version": version,
+                "fingerprint": fingerprint,
+                "mode": mode,
+                "items": items,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return "plan-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _find_shared_release(
+        state: dict[str, Any], version: str, item: dict[str, Any]
+    ) -> str | None:
+        """在既有发布事实中查找与统计项完全同身份（版本/操作/参数/ε）的记录。
+
+        只匹配**已经发布**的事实（releases 账本），因此一项尚未发布的统计
+        即使被多个安排共同引用，也不会在此泄露另一安排的结果。
+        """
+        for rid, record in state["releases"].items():
+            if (
+                record["version"] == version
+                and record["operation"] == item["operation"]
+                and record["params"] == item["params"]
+                and abs(record["epsilon"] - item["epsilon"]) <= 1e-12
+            ):
+                return rid
+        return None
+
+    def preview_plan(
+        self,
+        version: str,
+        items: list[dict[str, Any]],
+        *,
+        mode: str = PLAN_MODE_ATOMIC,
+        name: str = "",
+    ) -> dict[str, Any]:
+        """预演一组统计的发布安排：只显示身份、可共享事实与预算去向。
+
+        返回内容刻意**不含**任何带噪值、真实计数或噪声，也不产生可领取结果；
+        对每一项给出：统计身份、若兑现将新消耗的 ε（fresh_epsilon）、
+        以及可共享的既有发布事实（shared_from，仅引用其身份）。
+        """
+        with self._lock:
+            normalized = self._normalize_plan_items(items)
+            self._validate_plan_mode(mode)
+            state = self._ledger.snapshot()
+            if version not in state["versions"]:
+                raise UnknownVersion(f"未知数据版本: {version!r}")
+            fingerprint = state["versions"][version]["fingerprint"]
+            plan_id = self._plan_identity(version, fingerprint, mode, normalized)
+            remaining = state["total_epsilon"] - state["spent_epsilon"]
+            preview_items = []
+            total_fresh = 0.0
+            for index, item in enumerate(normalized):
+                shared_from = self._find_shared_release(state, version, item)
+                fresh = 0.0 if shared_from is not None else item["epsilon"]
+                total_fresh += fresh
+                preview_items.append(
+                    {
+                        "index": index,
+                        "operation": item["operation"],
+                        "params": dict(item["params"]),
+                        "epsilon": item["epsilon"],
+                        "shared_from": shared_from,
+                        "fresh_epsilon": fresh,
+                    }
+                )
+            existing = state["plans"].get(plan_id)
+            return {
+                "plan_id": plan_id,
+                "name": name,
+                "version": version,
+                "fingerprint": fingerprint,
+                "mode": mode,
+                "items": preview_items,
+                "total_fresh_epsilon": total_fresh,
+                "remaining_epsilon": remaining,
+                "budget_sufficient": total_fresh <= remaining + 1e-12,
+                "existing_plan_status": existing["status"] if existing else None,
+            }
+
+    def approve_plan(
+        self,
+        version: str,
+        items: list[dict[str, Any]],
+        *,
+        mode: str = PLAN_MODE_ATOMIC,
+        name: str = "",
+    ) -> str:
+        """批准一个发布安排并入账，返回其身份 plan_id。
+
+        安排身份由内容（版本指纹 + 模式 + 统计项）决定：相同内容重复批准
+        幂等返回同一身份；显示名称 name 不参与身份，仅为展示用途。
+        批准把安排绑定到**批准时**的数据版本与指纹，之后的新数据不影响它。
+        """
+        with self._lock:
+            normalized = self._normalize_plan_items(items)
+            self._validate_plan_mode(mode)
+            outcome: dict[str, Any] = {}
+
+            def _apply(state: dict[str, Any]) -> None:
+                if version not in state["versions"]:
+                    raise UnknownVersion(f"未知数据版本: {version!r}")
+                fingerprint = state["versions"][version]["fingerprint"]
+                plan_id = self._plan_identity(version, fingerprint, mode, normalized)
+                existing = state["plans"].get(plan_id)
+                if existing is not None:
+                    if existing["status"] == PLAN_STATUS_CANCELLED:
+                        raise InvalidPlanState(
+                            f"安排 {plan_id!r} 已取消；相同内容的安排身份不变，不能重新批准"
+                        )
+                    outcome["plan_id"] = plan_id
+                    return
+                state["plans"][plan_id] = {
+                    "plan_id": plan_id,
+                    "name": name,
+                    "version": version,
+                    "fingerprint": fingerprint,
+                    "mode": mode,
+                    "items": [
+                        {
+                            "operation": item["operation"],
+                            "params": dict(item["params"]),
+                            "epsilon": item["epsilon"],
+                            "status": ITEM_PENDING,
+                            "request_id": None,
+                            "shared_from": None,
+                            "epsilon_charged": 0.0,
+                        }
+                        for item in normalized
+                    ],
+                    "status": PLAN_STATUS_APPROVED,
+                    "created_at": _utc_now(),
+                    "events": [
+                        {"event": "approved", "at": _utc_now(), "epsilon_charged": 0.0}
+                    ],
+                }
+                outcome["plan_id"] = plan_id
+
+            self._ledger.commit(_apply)
+            return outcome["plan_id"]
+
+    def fulfill_plan(
+        self, plan_id: str, item_indexes: list[int] | None = None
+    ) -> dict[str, Any]:
+        """兑现获批安排（或其指定项），返回兑现后的公开安排状态。
+
+        - atomic：整组一同兑现。组内可共享既有发布事实的项直接引用、
+          不再扣预算；其余项合计 ε 超出余额时抛 BudgetExhausted，
+          **整组一项都不发布、不扣预算**（原子回滚）。
+        - staged：必须给出 item_indexes，本次只兑现这些项（同一笔原子提交）。
+          已发布项永久保留其事实与预算消耗；未发布项可取消。
+
+        实际消耗预算的兑现会在统计项上记录 request_id；共享既有事实的项
+        记录 shared_from 且 epsilon_charged=0，绝不重复消耗。
+        重复兑现同一项幂等返回既有事实，不重新加噪、不二次扣账。
+        """
+        with self._lock:
+
+            def _apply(state: dict[str, Any]) -> None:
+                plan = state["plans"].get(plan_id)
+                if plan is None:
+                    raise UnknownPlan(f"不存在的发布安排: {plan_id!r}")
+                if plan["status"] == PLAN_STATUS_CANCELLED:
+                    raise InvalidPlanState(f"安排 {plan_id!r} 已取消，不能兑现")
+                if plan["version"] not in self._versions:
+                    raise UnknownVersion(
+                        f"版本 {plan['version']!r} 的原始数据不在本进程内存中，"
+                        "请重新注册（账本记录仍有效）"
+                    )
+                if plan["mode"] == PLAN_MODE_ATOMIC:
+                    if item_indexes is not None:
+                        raise ValueError("atomic 安排只能整组兑现，不能指定子集")
+                    targets = list(range(len(plan["items"])))
+                else:
+                    if not item_indexes:
+                        raise ValueError("staged 安排必须指定本次兑现的统计项下标")
+                    targets = sorted(set(item_indexes))
+                    for index in targets:
+                        if not 0 <= index < len(plan["items"]):
+                            raise ValueError(f"统计项下标越界: {index}")
+                        if plan["items"][index]["status"] == ITEM_CANCELLED:
+                            raise InvalidPlanState(f"统计项 {index} 已取消，不能兑现")
+
+                todo = [
+                    i for i in targets if plan["items"][i]["status"] == ITEM_PENDING
+                ]
+                remaining = state["total_epsilon"] - state["spent_epsilon"]
+                shared: dict[int, str] = {}
+                fresh_total = 0.0
+                for index in todo:
+                    item = plan["items"][index]
+                    rid = self._find_shared_release(state, plan["version"], item)
+                    if rid is not None:
+                        shared[index] = rid
+                    else:
+                        fresh_total += item["epsilon"]
+                if fresh_total > remaining + 1e-12:
+                    raise BudgetExhausted(
+                        f"预算不足：本次兑现需新消耗 epsilon={fresh_total:g}，"
+                        f"剩余 {remaining:g}；未产生任何发布，也未扣预算"
+                    )
+
+                spent = state["spent_epsilon"]
+                for index in todo:
+                    item = plan["items"][index]
+                    if index in shared:
+                        item["status"] = ITEM_FULFILLED
+                        item["request_id"] = shared[index]
+                        item["shared_from"] = shared[index]
+                        item["epsilon_charged"] = 0.0
+                        plan["events"].append(
+                            {
+                                "event": "fulfilled_item",
+                                "at": _utc_now(),
+                                "item_index": index,
+                                "request_id": shared[index],
+                                "shared_from": shared[index],
+                                "epsilon_charged": 0.0,
+                            }
+                        )
+                        continue
+                    request_id = f"{plan_id}:item:{index}"
+                    op = catalog.get_operation(item["operation"])
+                    true_count = op.compute(
+                        self._versions[plan["version"]].data, item["params"]
+                    )
+                    noise = laplace_noise(self._rng, op.sensitivity, item["epsilon"])
+                    state["releases"][request_id] = {
+                        "version": plan["version"],
+                        "operation": item["operation"],
+                        "params": dict(item["params"]),
+                        "true_count": true_count,
+                        "noise": noise,
+                        "noisy_value": float(true_count) + noise,
+                        "epsilon": item["epsilon"],
+                        "mechanism": MECHANISM,
+                        "created_at": _utc_now(),
+                        "delivered": True,
+                        "plan_id": plan_id,
+                        "item_index": index,
+                    }
+                    spent += item["epsilon"]
+                    item["status"] = ITEM_FULFILLED
+                    item["request_id"] = request_id
+                    item["shared_from"] = None
+                    item["epsilon_charged"] = item["epsilon"]
+                    plan["events"].append(
+                        {
+                            "event": "fulfilled_item",
+                            "at": _utc_now(),
+                            "item_index": index,
+                            "request_id": request_id,
+                            "shared_from": None,
+                            "epsilon_charged": item["epsilon"],
+                        }
+                    )
+                state["spent_epsilon"] = spent
+                if all(i["status"] == ITEM_FULFILLED for i in plan["items"]):
+                    plan["status"] = PLAN_STATUS_FULFILLED
+                elif any(i["status"] == ITEM_FULFILLED for i in plan["items"]):
+                    plan["status"] = PLAN_STATUS_PARTIAL
+
+            self._ledger.commit(_apply)
+            return self.plan_status(plan_id)
+
+    def cancel_plan(self, plan_id: str) -> dict[str, Any]:
+        """取消安排中所有尚未兑现的统计项；已发布部分永久保留。
+
+        已发布项的发布事实与预算消耗不变；未发布项标记为已取消，
+        之后不能再兑现。重复取消幂等。
+        """
+        with self._lock:
+
+            def _apply(state: dict[str, Any]) -> None:
+                plan = state["plans"].get(plan_id)
+                if plan is None:
+                    raise UnknownPlan(f"不存在的发布安排: {plan_id!r}")
+                if plan["status"] == PLAN_STATUS_CANCELLED:
+                    return
+                for item in plan["items"]:
+                    if item["status"] == ITEM_PENDING:
+                        item["status"] = ITEM_CANCELLED
+                plan["status"] = PLAN_STATUS_CANCELLED
+                plan["events"].append(
+                    {"event": "cancelled", "at": _utc_now(), "epsilon_charged": 0.0}
+                )
+
+            self._ledger.commit(_apply)
+            return self.plan_status(plan_id)
+
+    def plan_status(self, plan_id: str) -> dict[str, Any]:
+        """公开查看安排状态：身份、各项状态与预算去向。
+
+        已兑现项附带公开带噪值（本就是公开事实）；未兑现项只有状态，
+        没有任何数值。不含真实计数与噪声。
+        """
+        state = self._ledger.snapshot()
+        plan = state["plans"].get(plan_id)
+        if plan is None:
+            raise UnknownPlan(f"不存在的发布安排: {plan_id!r}")
+        items = []
+        for index, item in enumerate(plan["items"]):
+            entry = {
+                "index": index,
+                "operation": item["operation"],
+                "params": dict(item["params"]),
+                "epsilon": item["epsilon"],
+                "status": item["status"],
+                "request_id": item["request_id"],
+                "shared_from": item["shared_from"],
+                "epsilon_charged": item["epsilon_charged"],
+            }
+            if item["status"] == ITEM_FULFILLED:
+                record = state["releases"][item["request_id"]]
+                entry["noisy_value"] = record["noisy_value"]
+                entry["mechanism"] = record["mechanism"]
+                entry["created_at"] = record["created_at"]
+            items.append(entry)
+        return {
+            "plan_id": plan["plan_id"],
+            "name": plan["name"],
+            "version": plan["version"],
+            "fingerprint": plan["fingerprint"],
+            "mode": plan["mode"],
+            "status": plan["status"],
+            "created_at": plan["created_at"],
+            "items": items,
+        }
+
+    def claim_plan(self, plan_id: str) -> list[ReleaseResult]:
+        """领取已兑现统计项的公开结果；未兑现项不产生任何结果。
+
+        只返回已发布事实（带噪值，不含真实计数与噪声）；共享项返回其
+        引用的同一份公开发布，不重复扣预算、不重新加噪。
+        """
+        state = self._ledger.snapshot()
+        plan = state["plans"].get(plan_id)
+        if plan is None:
+            raise UnknownPlan(f"不存在的发布安排: {plan_id!r}")
+        budget = self.budget()
+        results = []
+        for index, item in enumerate(plan["items"]):
+            if item["status"] != ITEM_FULFILLED:
+                continue
+            record = state["releases"][item["request_id"]]
+            results.append(
+                ReleaseResult(
+                    request_id=item["request_id"],
+                    version=record["version"],
+                    operation=record["operation"],
+                    params=dict(record["params"]),
+                    value=record["noisy_value"],
+                    mechanism=record["mechanism"],
+                    epsilon_spent=item["epsilon_charged"],
+                    epsilon_remaining=float(budget["remaining_epsilon"]),
+                    delta=DELTA,
+                    is_replay=True,
+                    created_at=record["created_at"],
+                )
+            )
+        return results
+
+    def list_plans(self) -> list[dict[str, Any]]:
+        """公开列出全部发布安排的身份与状态（不含任何统计数值）。"""
+        state = self._ledger.snapshot()
+        return [
+            {
+                "plan_id": plan["plan_id"],
+                "name": plan["name"],
+                "version": plan["version"],
+                "fingerprint": plan["fingerprint"],
+                "mode": plan["mode"],
+                "status": plan["status"],
+                "created_at": plan["created_at"],
+                "item_count": len(plan["items"]),
+                "fulfilled_count": sum(
+                    1 for i in plan["items"] if i["status"] == ITEM_FULFILLED
+                ),
+                "epsilon_charged_total": sum(
+                    i["epsilon_charged"] for i in plan["items"]
+                ),
+            }
+            for _, plan in sorted(
+                state["plans"].items(), key=lambda kv: kv[1]["created_at"]
+            )
+        ]
+
+    def audit_plan_events(self) -> list[dict[str, Any]]:
+        """公开审计：全部安排的批准/兑现/取消事件及预算变化。
+
+        只含发布事实（哪次兑现消耗了预算、哪项共享了既有事实）与 ε 变化，
+        不含真实计数、噪声或任何未发布统计的数值。
+        """
+        state = self._ledger.snapshot()
+        events = []
+        for plan_id, plan in sorted(state["plans"].items()):
+            for event in plan["events"]:
+                events.append({"plan_id": plan_id, **event})
+        events.sort(key=lambda e: e["at"])
+        return events
 
     def get_release(self, request_id: str) -> ReleaseResult | None:
         """按 ``request_id`` 取回既有发布的公开回执；不存在返回 ``None``。
