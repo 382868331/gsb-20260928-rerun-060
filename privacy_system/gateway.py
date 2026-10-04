@@ -644,13 +644,14 @@ class PrivacyGateway:
             return self._release_result_for(record)
 
     def claim_arrangement(self, arrangement_id: str) -> list[ReleaseResult]:
-        """领取安排中所有已经兑现且尚未通过该安排领取的结果。"""
-        claimed = []
-        arrangement = self.get_arrangement(arrangement_id)
-        for item in arrangement["items"]:
-            if item["status"] in (ITEM_PUBLISHED, ITEM_CLAIMED) and item["status"] != ITEM_CLAIMED:
-                claimed.append(self.claim_arrangement_item(arrangement_id, item["item_id"]))
-        return claimed
+        """领取安排中所有已兑现结果；重复领取返回原结果且不重复扣预算。"""
+        with self._lock:
+            arrangement = self.get_arrangement(arrangement_id)
+            return [
+                self.claim_arrangement_item(arrangement_id, item["item_id"])
+                for item in arrangement["items"]
+                if item["status"] in (ITEM_PUBLISHED, ITEM_CLAIMED)
+            ]
 
     def cancel_arrangement(self, arrangement_id: str) -> dict[str, Any]:
         """取消安排；整组模式只能在兑现前取消，分阶段模式只取消未兑现项。"""

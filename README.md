@@ -69,7 +69,8 @@
 4. MODE_PHASED = "phased" 调用 fulfill_arrangement_item(arrangement_id, item_id)
    逐项兑现。已发布的事实和预算消耗永久保留；未发布部分可由
    cancel_arrangement() 取消。
-5. claim_arrangement_item() 只领取已经兑现的结果，返回同一份带噪结果且不重复扣费；
+5. claim_arrangement_item()/claim_arrangement() 只领取已经兑现的结果，重复领取返回
+   同一份带噪结果且不重复扣费；重开后已领取状态仍可继续查询原结果。
    尚未兑现的统计不能领取，也不能借另一个安排的共享关系提前泄露。
 
 ### 交叠安排与共享

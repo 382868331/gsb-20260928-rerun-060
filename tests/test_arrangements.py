@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 from privacy_system import BudgetExhausted, DuplicateRequest, PrivacyGateway
-from privacy_system.gateway import MODE_ALL, MODE_PHASED
+from privacy_system.gateway import ITEM_CLAIMED, MODE_ALL, MODE_PHASED, PLAN_PARTIAL
 
 
 class ArrangementTest(unittest.TestCase):
@@ -212,6 +212,63 @@ class ArrangementTest(unittest.TestCase):
         claimed = reopened.claim_arrangement_item("phased", "total")
         self.assertEqual(claimed.value, original.value)
         self.assertTrue(math.isclose(reopened.budget()["spent_epsilon"], 1.0))
+
+    def test_group_reclaim_resumes_shared_result_after_restart(self) -> None:
+        gw = self._gateway(total=1.0)
+        gw.approve_arrangement("phased", self._items(), mode=MODE_PHASED)
+        gw.fulfill_arrangement_item("phased", "total")
+        original = gw.claim_arrangement_item("phased", "total")
+
+        with self.assertRaises(BudgetExhausted):
+            gw.fulfill_arrangement_item("phased", "beijing")
+        canceled = gw.cancel_arrangement("phased")
+        self.assertEqual(canceled["status"], PLAN_PARTIAL)
+        with self.assertRaises(ValueError):
+            gw.claim_arrangement_item("phased", "beijing")
+
+        shared_items = self._items()[:1]
+        preview = gw.preview_arrangement(shared_items, mode=MODE_ALL)
+        self.assertEqual(preview["items"][0]["existing_release_request_id"], "phased:total")
+        gw.approve_arrangement("shared-group", shared_items, mode=MODE_ALL)
+        fulfilled = gw.fulfill_arrangement("shared-group")
+        self.assertEqual(fulfilled["items"][0]["source_request_id"], "phased:total")
+
+        first_group_claim = gw.claim_arrangement("shared-group")
+        repeated_group_claim = gw.claim_arrangement("shared-group")
+        self.assertEqual(len(first_group_claim), 1)
+        self.assertEqual(len(repeated_group_claim), 1)
+        self.assertEqual(first_group_claim[0].value, original.value)
+        self.assertEqual(repeated_group_claim[0].value, original.value)
+        self.assertTrue(all(result.is_replay for result in repeated_group_claim))
+        self.assertTrue(math.isclose(repeated_group_claim[0].epsilon_spent, 0.0))
+        self.assertTrue(math.isclose(gw.budget()["spent_epsilon"], 1.0))
+        self.assertEqual([release["request_id"] for release in gw.list_releases()], ["phased:total"])
+        gw.close()
+
+        reopened = PrivacyGateway(self.db_path, total_epsilon=1.0, rng=random.Random(999))
+        self.addCleanup(reopened.close)
+        reopened.register_fictional_v1()
+        resumed_claim = reopened.claim_arrangement("shared-group")
+        self.assertEqual(len(resumed_claim), 1)
+        self.assertEqual(resumed_claim[0].request_id, "phased:total")
+        self.assertEqual(resumed_claim[0].value, original.value)
+        self.assertTrue(resumed_claim[0].is_replay)
+        self.assertTrue(math.isclose(resumed_claim[0].epsilon_spent, 0.0))
+        self.assertTrue(math.isclose(reopened.budget()["spent_epsilon"], 1.0))
+        self.assertEqual([release["request_id"] for release in reopened.list_releases()], ["phased:total"])
+        self.assertEqual(reopened.list_releases()[0]["noisy_value"], original.value)
+
+        shared_view = reopened.get_arrangement("shared-group")["items"][0]
+        self.assertEqual(shared_view["status"], ITEM_CLAIMED)
+        self.assertEqual(shared_view["source_request_id"], "phased:total")
+        events = reopened.public_audit_log()
+        self.assertEqual([event["kind"] for event in events], [
+            "arrangement_release",
+            "reuse_existing_release",
+        ])
+        self.assertTrue(math.isclose(sum(event["epsilon"] for event in events), 1.0))
+        with self.assertRaises(ValueError):
+            reopened.claim_arrangement_item("phased", "beijing")
 
     def test_public_audit_has_no_exact_statistics_or_noise(self) -> None:
         gw = self._gateway()
