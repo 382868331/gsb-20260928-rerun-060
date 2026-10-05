@@ -49,6 +49,12 @@ STATUS_DELIVERED_UNKNOWN = "published_unacknowledged"  # 已发布，但尚无�
 MODE_ALL = "all_at_once"
 MODE_PHASED = "phased"
 
+# 发布组合规划的两种比较方案：
+# 优先满足高价值请求（按价值降序贪心接纳，额度耗尽即拒绝其余）；
+# 均衡精度（所有候选按比例压缩 epsilon，共同分享剩余额度）。
+STRATEGY_PRIORITY = "priority_first"
+STRATEGY_BALANCED = "balanced_precision"
+
 PLAN_APPROVED = "approved"
 PLAN_FULFILLED = "fulfilled"
 PLAN_PARTIAL = "partial"
@@ -680,6 +686,270 @@ class PrivacyGateway:
             self._require_arrangement(self._ledger.snapshot(), arrangement_id)
         )
 
+    # ---------- 发布组合规划：比较方案、确认前重核、按阶段兑现 ----------
+
+    def plan_portfolio(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        strategy: str = STRATEGY_PRIORITY,
+        phases: int = 1,
+    ) -> dict[str, Any]:
+        """预演一组候选声明的预算去向与阶段安排。
+
+        每个候选声明除统计参数外可携带：
+
+        * epsilon：可接受精度（愿意为该统计支付的 ε，越大越精确）；
+        * latest_phase：最晚领取阶段（结果必须不晚于该阶段发布）；
+        * value：价值权重，供 priority_first 方案排序。
+
+        预演只读当前账本快照：不落盘、不批准、不预留预算、不抽噪声，
+        也不产生任何可领取结果；未发布的计划既不算已花预算，
+        也不能被领取。
+        """
+        state = self._ledger.snapshot()
+        plan = self._build_portfolio_plan(
+            candidates, strategy=strategy, phases=phases, state=state
+        )
+        plan["approved"] = False
+        return plan
+
+    def confirm_portfolio(
+        self,
+        plan_id: str,
+        candidates: list[dict[str, Any]],
+        *,
+        strategy: str = STRATEGY_PRIORITY,
+        phases: int = 1,
+    ) -> dict[str, Any]:
+        """确认组合计划：在账本锁内重新核对已发生发布与剩余额度。
+
+        确认时基于磁盘最新状态重新计算共享关系与可接纳集合——
+        预演之后发生的发布会改变可共享事实和剩余额度，因此只接纳
+        确认当下仍可兑现的部分，被挤出的候选连同缺口原因记入
+        rejected。被接纳部分冻结为一个分阶段安排（仍不扣预算、
+        不产生结果），之后用 fulfill_arrangement_phase() 按阶段兑现。
+        """
+        if not plan_id or not isinstance(plan_id, str):
+            raise ValueError("plan_id 必须是非空字符串")
+        with self._lock:
+            def _apply(state: dict[str, Any]) -> dict[str, Any]:
+                existing = state["arrangements"].get(plan_id)
+                if existing is not None:
+                    # 幂等：同一 plan_id 重复确认返回首次冻结的结果。
+                    return existing
+                plan = self._build_portfolio_plan(
+                    candidates, strategy=strategy, phases=phases, state=state
+                )
+                items = []
+                for entry in plan["items"]:
+                    if entry["status"] != "accepted":
+                        continue
+                    items.append(
+                        {
+                            "item_id": entry["item_id"],
+                            "label": entry["label"],
+                            "version": entry["version"],
+                            "fingerprint": entry["data_fingerprint"],
+                            "operation": entry["operation"],
+                            "params": dict(entry["params"]),
+                            "epsilon": entry["planned_epsilon"],
+                            "requested_epsilon": entry["requested_epsilon"],
+                            "value": entry["value"],
+                            "latest_phase": entry["latest_phase"],
+                            "phase": entry["phase"],
+                            "identity": entry["stat_identity"],
+                            "status": ITEM_APPROVED,
+                            "source_request_id": None,
+                        }
+                    )
+                arrangement = {
+                    "arrangement_id": plan_id,
+                    "mode": MODE_PHASED,
+                    "status": PLAN_APPROVED,
+                    "approved_at": _utc_now(),
+                    "items": items,
+                    "strategy": strategy,
+                    "phases": phases,
+                    "rejected": plan["rejected"],
+                }
+                state["arrangements"][plan_id] = arrangement
+                return arrangement
+
+            return self._public_arrangement(self._ledger.commit(_apply))
+
+    def fulfill_arrangement_phase(self, arrangement_id: str, phase: int) -> dict[str, Any]:
+        """兑现分阶段安排中指定阶段的全部待兑现项。
+
+        逐项独立原子提交：每一项兑现时都会在账本锁内重新查找
+        可共享的已发布事实（ε 为 0）并重新核对余额；中途余额不足时
+        抛 BudgetExhausted，本阶段已兑现的项和更早阶段的
+        发布事实不会回滚。
+        """
+        with self._lock:
+            arrangement = self.get_arrangement(arrangement_id)
+            for item in arrangement["items"]:
+                if item.get("phase") == phase and item["status"] == ITEM_APPROVED:
+                    self.fulfill_arrangement_item(arrangement_id, item["item_id"])
+            return self.get_arrangement(arrangement_id)
+
+    def _build_portfolio_plan(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        strategy: str,
+        phases: int,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        if strategy not in (STRATEGY_PRIORITY, STRATEGY_BALANCED):
+            raise ValueError(
+                f"strategy 必须是 {STRATEGY_PRIORITY!r} 或 {STRATEGY_BALANCED!r}"
+            )
+        if not isinstance(phases, int) or phases < 1:
+            raise ValueError("phases 必须是正整数")
+        normalized = self._normalize_items(candidates)
+        for item, raw in zip(normalized, candidates):
+            value = float(raw.get("value", 1.0))
+            if value < 0:
+                raise ValueError("候选声明的 value 不能为负数")
+            latest_phase = int(raw.get("latest_phase", phases))
+            if latest_phase < 1:
+                raise ValueError("候选声明的 latest_phase 必须 >= 1")
+            item["value"] = value
+            item["latest_phase"] = min(latest_phase, phases)
+
+        remaining = state["total_epsilon"] - state["spent_epsilon"]
+        reused_epsilon = 0.0
+        reuse_items: list[dict[str, Any]] = []
+        groups: dict[str, dict[str, Any]] = {}
+        group_order: list[dict[str, Any]] = []
+        for item in normalized:
+            source = self._find_release(state, item["identity"])
+            if source is not None:
+                # 与已提交发布同统计身份：共享同一发布，只消耗一次预算。
+                item["budget_action"] = "reuse_existing_release"
+                item["shared_with"] = source[0]
+                item["planned_epsilon"] = item["epsilon"]
+                item["charged_epsilon"] = 0.0
+                item["phase"] = item["latest_phase"]
+                reuse_items.append(item)
+                reused_epsilon += source[1]["epsilon"]
+                continue
+            group = groups.get(item["identity"])
+            if group is None:
+                group = {
+                    "identity": item["identity"],
+                    "members": [],
+                    "epsilon": 0.0,
+                    "value": 0.0,
+                    "latest_phase": phases,
+                }
+                groups[item["identity"]] = group
+                group_order.append(group)
+            group["members"].append(item)
+            # 计划内共享同一统计身份的多个声明只发布一次：
+            # 取组内最高精度（最大 ε）满足所有成员，预算只计一次。
+            group["epsilon"] = max(group["epsilon"], item["epsilon"])
+            group["value"] += item["value"]
+            group["latest_phase"] = min(group["latest_phase"], item["latest_phase"])
+
+        accepted_groups: list[tuple[dict[str, Any], float]] = []
+        rejected: list[dict[str, Any]] = []
+        if strategy == STRATEGY_PRIORITY:
+            ordered = sorted(
+                group_order,
+                key=lambda g: (-g["value"], g["latest_phase"], g["identity"]),
+            )
+            committed = 0.0
+            for group in ordered:
+                if committed + group["epsilon"] <= remaining + 1e-12:
+                    committed += group["epsilon"]
+                    accepted_groups.append((group, group["epsilon"]))
+                else:
+                    rejected.append(
+                        {
+                            "item_ids": [m["item_id"] for m in group["members"]],
+                            "labels": [m["label"] for m in group["members"]],
+                            "reason": "budget_exhausted",
+                            "epsilon_needed": group["epsilon"],
+                            "epsilon_remaining": remaining - committed,
+                        }
+                    )
+        else:
+            total_needed = sum(group["epsilon"] for group in group_order)
+            if total_needed <= remaining + 1e-12:
+                scale = 1.0
+            elif remaining > 0 and total_needed > 0:
+                # 均衡精度：所有候选按同一比例压缩 ε，共同分享剩余额度。
+                scale = remaining / total_needed
+            else:
+                scale = 0.0
+            for group in group_order:
+                planned = group["epsilon"] * scale
+                if planned > 0:
+                    accepted_groups.append((group, planned))
+                else:
+                    rejected.append(
+                        {
+                            "item_ids": [m["item_id"] for m in group["members"]],
+                            "labels": [m["label"] for m in group["members"]],
+                            "reason": "budget_exhausted",
+                            "epsilon_needed": group["epsilon"],
+                            "epsilon_remaining": remaining,
+                        }
+                    )
+
+        plan_items: list[dict[str, Any]] = []
+        total_new_epsilon = 0.0
+        for group, planned in accepted_groups:
+            payer = group["members"][0]
+            for member in group["members"]:
+                member["planned_epsilon"] = planned
+                member["charged_epsilon"] = planned if member is payer else 0.0
+                member["phase"] = group["latest_phase"]
+                if member is payer:
+                    member["budget_action"] = "new_release"
+                    member["shared_with"] = None
+                else:
+                    member["budget_action"] = "shared_planned_release"
+                    member["shared_with"] = payer["item_id"]
+                member["status"] = "accepted"
+                total_new_epsilon += member["charged_epsilon"]
+                plan_items.append(member)
+        for item in reuse_items:
+            item["status"] = "accepted"
+            plan_items.append(item)
+
+        def public_entry(item: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "item_id": item["item_id"],
+                "label": item["label"],
+                "stat_identity": item["identity"],
+                "version": item["version"],
+                "data_fingerprint": item["fingerprint"],
+                "operation": item["operation"],
+                "params": dict(item["params"]),
+                "requested_epsilon": item["epsilon"],
+                "planned_epsilon": item["planned_epsilon"],
+                "epsilon_charged_in_this_plan": item["charged_epsilon"],
+                "value": item["value"],
+                "latest_phase": item["latest_phase"],
+                "phase": item["phase"],
+                "budget_action": item["budget_action"],
+                "shared_with": item["shared_with"],
+                "status": item["status"],
+            }
+
+        return {
+            "strategy": strategy,
+            "phases": phases,
+            "items": [public_entry(item) for item in plan_items],
+            "rejected": rejected,
+            "new_epsilon_required": total_new_epsilon,
+            "existing_release_epsilon_reused": reused_epsilon,
+            "remaining_epsilon_now": remaining,
+        }
+
     def list_arrangements(self) -> list[dict[str, Any]]:
         return [
             self._public_arrangement(arrangement)
@@ -929,27 +1199,35 @@ class PrivacyGateway:
 
     @staticmethod
     def _public_arrangement(arrangement: dict[str, Any]) -> dict[str, Any]:
-        return {
+        items = []
+        for item in arrangement["items"]:
+            entry = {
+                "item_id": item["item_id"],
+                "label": item["label"],
+                "stat_identity": item.get("identity"),
+                "version": item["version"],
+                "data_fingerprint": item.get("fingerprint"),
+                "operation": item["operation"],
+                "params": dict(item["params"]),
+                "epsilon": item["epsilon"],
+                "status": item["status"],
+                "source_request_id": item.get("source_request_id"),
+            }
+            for optional in ("phase", "value", "requested_epsilon", "latest_phase"):
+                if optional in item:
+                    entry[optional] = item[optional]
+            items.append(entry)
+        view = {
             "arrangement_id": arrangement["arrangement_id"],
             "mode": arrangement["mode"],
             "status": arrangement["status"],
             "approved_at": arrangement["approved_at"],
-            "items": [
-                {
-                    "item_id": item["item_id"],
-                    "label": item["label"],
-                    "stat_identity": item.get("identity"),
-                    "version": item["version"],
-                    "data_fingerprint": item.get("fingerprint"),
-                    "operation": item["operation"],
-                    "params": dict(item["params"]),
-                    "epsilon": item["epsilon"],
-                    "status": item["status"],
-                    "source_request_id": item.get("source_request_id"),
-                }
-                for item in arrangement["items"]
-            ],
+            "items": items,
         }
+        for optional in ("strategy", "phases", "rejected"):
+            if optional in arrangement:
+                view[optional] = arrangement[optional]
+        return view
 
     # ---------- 故障注入（测试用） ----------
 

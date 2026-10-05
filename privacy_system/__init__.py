@@ -14,6 +14,8 @@ from .errors import (
 from .gateway import (
     MODE_ALL,
     MODE_PHASED,
+    STRATEGY_BALANCED,
+    STRATEGY_PRIORITY,
     PrivacyGateway,
     ReleaseResult,
 )
@@ -30,4 +32,6 @@ __all__ = [
     "UnknownVersion",
     "MODE_ALL",
     "MODE_PHASED",
+    "STRATEGY_PRIORITY",
+    "STRATEGY_BALANCED",
 ]
